@@ -1,0 +1,166 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360 
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Restore Server Data
+        uses: actions/download-artifact@v4
+        with:
+          name: server-backup
+          path: C:\server-data
+        continue-on-error: true
+
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          netsh advfirewall firewall add rule name="BlueMap-Web" dir=in action=allow protocol=TCP localport=8100
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90);
+              Lower   = [char[]](97..122);
+              Number  = [char[]](48..57);
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          
+          Stop-Service -Name "Tailscale" -Force
+          
+          $savedState = "C:\server-data\ts-state"
+          if (Test-Path $savedState) {
+              Copy-Item -Path "$savedState\*" -Destination "C:\ProgramData\Tailscale" -Recurse -Force
+          }
+          
+          Start-Service -Name "Tailscale"
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection & Create IP.json
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-rdp-server
+          
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) { exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          
+          $serverDir = "C:\server-data"
+          if (-not (Test-Path $serverDir)) { New-Item -ItemType Directory -Force -Path $serverDir }
+          
+          $jsonContent = @{
+              TailscaleIP = $tsIP;
+              Hostname = "gh-rdp-server";
+              LastUpdated = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+          } | ConvertTo-Json
+          
+          Set-Content -Path "$serverDir\ip.json" -Value $jsonContent
+
+      - name: Update Cloudflare DNS Record
+        run: |
+          $cfToken = "${{ secrets.CF_API_TOKEN }}"
+          $cfZoneId = "${{ secrets.CF_ZONE_ID }}"
+          $recordName = "mc.neonystormmc.qzz.io"
+          $ip = $env:TAILSCALE_IP
+          
+          $headers = @{ "Authorization" = "Bearer $cfToken"; "Content-Type" = "application/json" }
+          $url = "https://api.cloudflare.com/client/v4/zones/$cfZoneId/dns_records?name=$recordName&type=A"
+          
+          try {
+              $response = Invoke-RestMethod -Uri $url -Headers $headers -Method Get
+              $recordId = $response.result[0].id
+              
+              if ($recordId) {
+                  $body = @{ type="A"; name=$recordName; content=$ip; ttl=300; proxied=$false } | ConvertTo-Json
+                  Invoke-RestMethod -Uri "https://api.cloudflare.com/client/v4/zones/$cfZoneId/dns_records/$recordId" -Headers $headers -Method Put -Body $body
+              }
+          } catch { Write-Host "CF Hatasi: $_" }
+
+      - name: Maintain Connection Loop
+        run: |
+          Write-Host "Address (IP): $env:TAILSCALE_IP"
+          Write-Host "Password: $env:RDP_CREDS"
+          
+          $timeout = 20700
+          $interval = 300
+          $elapsed = 0
+          while ($elapsed -lt $timeout) {
+              Write-Host "[$(Get-Date)] RDP Aktif... Kalan: $(($timeout - $elapsed) / 60) dk."
+              Start-Sleep -Seconds $interval
+              $elapsed += $interval
+          }
+
+      - name: Release File Locks & Save Data
+        if: always()
+        run: |
+          # Java (Minecraft) ve Tailscale işlemlerini zorla kapatarak dosya kilitlerini serbest bırakır
+          Stop-Process -Name "java" -Force -ErrorAction SilentlyContinue
+          Stop-Process -Name "tailscale*" -Force -ErrorAction SilentlyContinue
+          Stop-Service -Name "Tailscale" -Force -ErrorAction SilentlyContinue
+          
+          # Dosya kilitlerinin işletim sistemi tarafından tamamen kalkması için bekle
+          Start-Sleep -Seconds 5
+          
+          $savePath = "C:\server-data\ts-state"
+          if (-not (Test-Path $savePath)) { New-Item -ItemType Directory -Force -Path $savePath }
+          Copy-Item -Path "C:\ProgramData\Tailscale\*" -Destination $savePath -Recurse -Force -ErrorAction SilentlyContinue
+
+      - name: Upload Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-backup
+          path: C:\server-data
+          retention-days: 1
+
+      - name: Trigger Next Run
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow run RDP
